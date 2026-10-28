@@ -1,0 +1,217 @@
+# =============================================================================
+# 云构建「未签名真机 IPA」—— jev-chat-jarvis-ios
+#
+# 用法：放到仓库的  .github/workflows/ios-unsigned-ipa.yml
+#
+# 产物：JevJarvis-unsigned.ipa
+#       Payload/JevJarvis.app        (com.jevchat.jarvis)
+#         PlugIns/JevKeyboard.appex  (com.jevchat.jarvis.keyboard)
+#         PlugIns/JevLive.appex      (com.jevchat.jarvis.live)
+#       全部 arm64 / device 构建。包本身不能直装，需要 Sideloadly / AltStore
+#       用你自己的 Apple ID 重签后才能上真机（见同目录 README）。
+#
+# 两个出口，任选其一：
+#   1. Actions → 本次运行 → Artifacts → JevJarvis-unsigned-ipa
+#   2. 分支 unsigned-ipa（本 workflow 会把 ipa 单独提交到一个 orphan 分支）
+#      https://codeload.github.com/<owner>/<repo>/zip/refs/heads/unsigned-ipa
+#      —— 给 github.com / objects.githubusercontent.com 连不上的网络用。
+#
+# 工程信息（来自仓库 project.yml）：
+#   project = JevJarvis.xcodeproj（仓库根目录，xcodegen 生成好并已入库）
+#   scheme  = JevJarvis（仓库自带 shared scheme；JevKeyboard 也有一个）
+#   app 依赖 JevKeyboard + JevLive，scheme 构建会自动带上两个扩展
+# =============================================================================
+name: iOS unsigned IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: "xcodeproj 相对路径"
+        required: false
+        default: "JevJarvis.xcodeproj"
+      scheme:
+        description: "Xcode scheme"
+        required: false
+        default: "JevJarvis"
+  push:
+    paths:
+      - ".github/workflows/ios-unsigned-ipa.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: jev-unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 选用最新的 Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "--- 镜像里预装的 Xcode ---"
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          latest="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort | tail -n 1 || true)"
+          if [ -n "${latest}" ]; then
+            echo "切换到 ${latest}"
+            sudo xcode-select -s "${latest}/Contents/Developer" || true
+          fi
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i "ios" || true
+
+      - name: 确定 project / scheme
+        id: probe
+        shell: bash
+        env:
+          PROJ_INPUT: ${{ github.event.inputs.project }}
+          SCHEME_INPUT: ${{ github.event.inputs.scheme }}
+        run: |
+          set -euo pipefail
+          PROJ="${PROJ_INPUT:-JevJarvis.xcodeproj}"
+          if [ ! -d "${PROJ}" ]; then
+            echo "::error::找不到工程目录 ${PROJ}"
+            exit 1
+          fi
+          SCHEME="${SCHEME_INPUT:-JevJarvis}"
+          echo "project=${PROJ}" >> "${GITHUB_OUTPUT}"
+          echo "scheme=${SCHEME}"  >> "${GITHUB_OUTPUT}"
+          echo "本次使用： project=${PROJ}  scheme=${SCHEME}"
+          xcodebuild -list -project "${PROJ}"
+
+      - name: 编译（关闭代码签名，device / arm64）
+        shell: bash
+        env:
+          PROJ: ${{ steps.probe.outputs.project }}
+          SCHEME: ${{ steps.probe.outputs.scheme }}
+        run: |
+          set -uo pipefail
+          COMMON=(
+            -project "${PROJ}"
+            -configuration Release
+            -sdk iphoneos
+            -destination "generic/platform=iOS"
+            -derivedDataPath "${RUNNER_TEMP}/dd"
+            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGN_IDENTITY=""
+          )
+          if xcodebuild "${COMMON[@]}" -scheme "${SCHEME}" build; then
+            echo "scheme 构建成功"
+            exit 0
+          fi
+          echo "::warning::scheme 构建失败，改用 -target ${SCHEME} 重试"
+          xcodebuild "${COMMON[@]}" -target "${SCHEME}" build
+
+      - name: 组装 Payload 并打包 ipa
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          PRODUCT_DIR="${RUNNER_TEMP}/dd/Build/Products/Release-iphoneos"
+          APP="$(find "${PRODUCT_DIR}" -maxdepth 1 -name '*.app' -print -quit 2>/dev/null || true)"
+          if [ -z "${APP}" ]; then
+            echo "::error::没有找到 .app，下面是产物目录："
+            ls -la "${PRODUCT_DIR}" || true
+            exit 1
+          fi
+          APP_NAME="$(basename "${APP}" .app)"
+          echo "找到 ${APP_NAME}.app"
+
+          echo "--- 内嵌扩展 ---"
+          ls "${APP}/PlugIns" 2>/dev/null || echo "(没有 PlugIns 目录)"
+          APEX_COUNT="$(find "${APP}/PlugIns" -maxdepth 1 -name '*.appex' 2>/dev/null | wc -l | tr -d ' ')"
+          echo "扩展数量：${APEX_COUNT}"
+          if [ "${APEX_COUNT}" -lt 2 ]; then
+            echo "::error::扩展不足 2 个（键盘 JevKeyboard + 直播 JevLive），装到手机也没键盘用"
+            exit 1
+          fi
+
+          echo "--- 关键 bundle id ---"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${APP}/Info.plist"
+          for e in "${APP}"/PlugIns/*.appex; do
+            printf '  %s -> ' "$(basename "$e")"
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$e/Info.plist"
+          done
+
+          STAGE="${RUNNER_TEMP}/stage"
+          rm -rf "${STAGE}"
+          mkdir -p "${STAGE}/Payload"
+          cp -R "${APP}" "${STAGE}/Payload/"
+
+          IPA="${RUNNER_TEMP}/${APP_NAME}-unsigned.ipa"
+          ( cd "${STAGE}" && ditto -c -k --sequesterRsrc --keepParent Payload "${IPA}" )
+
+          echo "ipa=${IPA}" >> "${GITHUB_OUTPUT}"
+          echo "app_name=${APP_NAME}" >> "${GITHUB_OUTPUT}"
+
+          echo "--- ipa 结构（前 20 行）---"
+          unzip -l "${IPA}" | head -n 20
+          echo "--- 可执行文件架构（应为 arm64）---"
+          BIN="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${APP}/Info.plist")"
+          file "${APP}/${BIN}" || true
+          for e in "${APP}"/PlugIns/*.appex; do
+            EBIN="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$e/Info.plist")"
+            file "$e/${EBIN}" || true
+          done
+          echo "最小系统版本："
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "${APP}/Info.plist" || true
+          shasum -a 256 "${IPA}"
+          ls -lh "${IPA}"
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JevJarvis-unsigned-ipa
+          path: ${{ steps.pack.outputs.ipa }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 把 ipa 推到 unsigned-ipa 分支（给受限网络直接下载）
+        if: success()
+        shell: bash
+        env:
+          IPA_PATH: ${{ steps.pack.outputs.ipa }}
+          APP_NAME: ${{ steps.pack.outputs.app_name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          OUT="${RUNNER_TEMP}/ipa-branch"
+          rm -rf "${OUT}"
+          mkdir -p "${OUT}"
+          cp "${IPA_PATH}" "${OUT}/${APP_NAME}-unsigned.ipa"
+          ( cd "${OUT}" && shasum -a 256 *.ipa > SHA256SUMS.txt )
+
+          cd "${OUT}"
+          git init -q
+          git checkout -q -b unsigned-ipa
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "unsigned ipa $(date -u +%Y%m%dT%H%M%SZ)"
+          if git push -q --force \
+              "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" unsigned-ipa; then
+            echo "已推送：https://codeload.github.com/${GITHUB_REPOSITORY}/zip/refs/heads/unsigned-ipa"
+          else
+            echo "::warning::推送到 unsigned-ipa 分支失败，请用本次运行的 Artifacts 下载"
+          fi
+
+      - name: 结果摘要
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### 构建${{ job.status }}"
+            echo ""
+            echo "- App：\`${{ steps.pack.outputs.app_name }}\`"
+            echo "- 这个包是**未签名**的，不能直接安装到 iPhone。"
+            echo "- 下载：本次运行 Artifacts，或分支 \`unsigned-ipa\` 的 zip。"
+            echo "- 下一步：Sideloadly 用你的 Apple ID 重签安装（键盘扩展必须一起签）。"
+          } >> "${GITHUB_STEP_SUMMARY}"
