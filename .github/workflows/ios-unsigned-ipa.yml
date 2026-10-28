@@ -34,6 +34,10 @@ on:
         description: "Xcode scheme"
         required: false
         default: "JevJarvis"
+      entitlements:
+        description: "补一层 ad-hoc 签名把 App Group entitlement 写进包（yes / no）"
+        required: false
+        default: "no"
   push:
     paths:
       - ".github/workflows/ios-unsigned-ipa.yml"
@@ -109,6 +113,33 @@ jobs:
           fi
           echo "::warning::scheme 构建失败，改用 -target ${SCHEME} 重试"
           xcodebuild "${COMMON[@]}" -target "${SCHEME}" build
+
+      - name: 补 ad-hoc 签名（可选：把 App Group entitlement 写进包）
+        if: ${{ github.event.inputs.entitlements == 'yes' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PRODUCT_DIR="${RUNNER_TEMP}/dd/Build/Products/Release-iphoneos"
+          APP="$(find "${PRODUCT_DIR}" -maxdepth 1 -name '*.app' -print -quit)"
+          echo "给 ${APP} 补 entitlement 并 ad-hoc 签名"
+          for e in "${APP}"/PlugIns/*.appex; do
+            name="$(basename "${e}")"
+            case "${name}" in
+              JevKeyboard.appex) ENT="Keyboard/JevKeyboard.entitlements" ;;
+              JevLive.appex)     ENT="Broadcast/JevLive.entitlements" ;;
+              *)                 ENT="" ;;
+            esac
+            if [ -n "${ENT}" ]; then
+              codesign --force --sign - --timestamp=none --entitlements "${ENT}" "${e}"
+            else
+              codesign --force --sign - --timestamp=none "${e}"
+            fi
+            echo "--- ${name} entitlements ---"
+            codesign -d --entitlements :- "${e}" 2>&1 || true
+          done
+          codesign --force --sign - --timestamp=none --entitlements App/JevJarvis.entitlements "${APP}"
+          echo "--- app entitlements ---"
+          codesign -d --entitlements :- "${APP}" 2>&1 || true
 
       - name: 组装 Payload 并打包 ipa
         id: pack
