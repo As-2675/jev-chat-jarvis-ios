@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import Combine
 
 /// 开始页：键盘装没装、完全访问给没给、共享配置通不通，一眼看清。
@@ -6,6 +7,7 @@ struct SetupView: View {
     @EnvironmentObject private var store: ConfigStore
     @State private var kbStatus: KeyboardStatus?
     @State private var groupOK = false
+    @State private var copiedAt: Date?
 
     private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
@@ -14,6 +16,7 @@ struct SetupView: View {
             List {
                 languageSection
                 statusSection
+                syncSection
                 howSection
                 privacySection
             }
@@ -63,7 +66,7 @@ struct SetupView: View {
             row(icon: "externaldrive.connected.to.line.below", title: jevLocalized(store.language, zh: "App Group 共享", en: "App Group sharing"),
                 ok: groupOK, detail: groupOK
                     ? jevLocalized(store.language, zh: "配置可以同步到键盘", en: "Configuration syncs to the keyboard")
-                    : jevLocalized(store.language, zh: "共享容器不可用：请确认用 Xcode 把 App 和键盘扩展签在同一个 Team 下", en: "The shared container is unavailable. Sign both targets with the same Team."))
+                    : jevLocalized(store.language, zh: "共享容器不可用（免费签名常见）：用下面的「复制配置给键盘」，再到键盘上点「从剪贴板导入配置」", en: "The shared container is unavailable (common with a free signing account). Use Copy config for the keyboard below, then tap Import config from clipboard on the keyboard."))
         } header: {
             Text(jevLocalized(store.language, zh: "状态", en: "Status"))
         } footer: {
@@ -82,6 +85,38 @@ struct SetupView: View {
             }
         }
         .padding(.vertical, 2)
+    }
+
+    // MARK: 配置搬运（App Group 不可用时的退路）
+
+    private var syncSection: some View {
+        Section {
+            Button {
+                copyConfigForKeyboard()
+            } label: {
+                Label(jevLocalized(store.language, zh: "复制配置给键盘", en: "Copy config for the keyboard"),
+                      systemImage: "doc.on.doc")
+            }
+            if let copiedAt {
+                Text(jevLocalized(store.language,
+                                  zh: "已复制（\(timeAgo(copiedAt))）。现在切到键盘，点「从剪贴板导入配置」",
+                                  en: "Copied \(timeAgo(copiedAt)). Switch to the keyboard now and tap Import config from clipboard."))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        } header: {
+            Text(jevLocalized(store.language, zh: "配置同步", en: "Config sync"))
+        } footer: {
+            Text(jevLocalized(store.language,
+                              zh: "免费签名时 App Group 常常拿不到，键盘就读不到这里存的配置。用这个按钮把整份配置（含 API Key）放进剪贴板，在键盘上导入一次即可。注意它会覆盖你刚复制的聊天内容——导入完再去复制消息。",
+                              en: "With a free signing account the App Group is often unavailable, so the keyboard cannot read this config. This button puts the whole config (API key included) on the clipboard; import it once on the keyboard. It replaces whatever chat message you copied, so copy the message again afterwards."))
+        }
+    }
+
+    private func copyConfigForKeyboard() {
+        let cfg = JevStore.loadConfig()
+        guard let payload = JevConfigTransfer.encode(cfg) else { return }
+        UIPasteboard.general.string = payload
+        copiedAt = Date()
     }
 
     // MARK: 步骤
