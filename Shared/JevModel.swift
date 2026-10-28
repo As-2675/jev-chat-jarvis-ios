@@ -129,16 +129,26 @@ enum JevStore {
     private static let statusKey = "jev.kbstatus.v1"
     private static let canaryKey = "jev.canary.v1"
 
-    static var defaults: UserDefaults {
-        UserDefaults(suiteName: appGroupID) ?? .standard
-    }
+    /// 真正可用的 App Group 容器；每个进程只探测一次。
+    /// 免费 Apple ID / Sideloadly 重签时 entitlement 常被剥掉，此时
+    /// `UserDefaults(suiteName:)` 依然返回对象，但写进去读不回来也落不了盘。
+    /// 所以这里用 canary 写读验证：不通就退回各自的私有 `.standard`，
+    /// 让「App 复制配置 → 键盘从剪贴板导入」这条退路能真正生效。
+    private static let groupContainer: UserDefaults? = {
+        // containerURL 在没有 entitlement 时安全返回 nil（不会抛异常），先过这一关
+        guard FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID) != nil,
+              let d = UserDefaults(suiteName: appGroupID) else { return nil }
+        let stamp = "t\(UUID().uuidString)"
+        d.set(stamp, forKey: canaryKey)
+        guard d.string(forKey: canaryKey) == stamp else { return nil }
+        d.removeObject(forKey: canaryKey)
+        return d
+    }()
+
+    static var defaults: UserDefaults { groupContainer ?? .standard }
 
     /// App Group 容器是否真的可写可读（签名没带上 entitlement 时 suite 会静默退化为私有容器）。
-    static var groupWritable: Bool {
-        let stamp = "t\(Date().timeIntervalSince1970)"
-        defaults.set(stamp, forKey: canaryKey)
-        return defaults.string(forKey: canaryKey) == stamp
-    }
+    static var groupWritable: Bool { groupContainer != nil }
 
     static func loadConfig() -> JevConfig {
         guard let data = defaults.data(forKey: configKey),
@@ -193,4 +203,29 @@ enum JevStore {
         defaults.set(String((prev + "[\(stamp)] \(line)\n").suffix(6000)), forKey: diagKey)
     }
 #endif
+}
+
+// MARK: - 配置搬运（App Group 不可用时的退路）
+
+/// 免费签名（Sideloadly + 个人 Apple ID）常常拿不到 App Group entitlement，键盘就读不到
+/// App 写的配置，只能一直显示「还没配置生成层」。退路：App 把整份配置编码成一段文本放进
+/// 剪贴板，用户在键盘上点「从剪贴板导入配置」，键盘存进自己沙盒里的 UserDefaults。
+/// 两边各持同一份 JevConfig，行为完全一致；改过配置后需要再导一次。
+enum JevConfigTransfer {
+    /// 前缀用来防止把普通聊天内容误当成配置
+    static let marker = "JEVCFG1:"
+
+    static func encode(_ cfg: JevConfig) -> String? {
+        guard let data = try? JSONEncoder().encode(cfg) else { return nil }
+        return marker + data.base64EncodedString()
+    }
+
+    static func decode(_ text: String?) -> JevConfig? {
+        guard let raw = text?.trimmingCharacters(in: .whitespacesAndNewlines),
+              raw.hasPrefix(marker) else { return nil }
+        let base64 = String(raw.dropFirst(marker.count))
+        guard let data = Data(base64Encoded: base64), !data.isEmpty,
+              let cfg = try? JSONDecoder().decode(JevConfig.self, from: data) else { return nil }
+        return cfg
+    }
 }
