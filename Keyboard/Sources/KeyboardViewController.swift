@@ -489,9 +489,16 @@ final class KeyboardViewController: UIInputViewController {
         if JevDraft(cfg: cfg).isConfigured {
             // 配置完整时不占行
         } else {
-            let warn = KB.label(L("⚠️ 还没配置生成层：打开 Jev Jarvis App →「模型」页填 API Key", "⚠️ Generation is not configured: open Jev Jarvis → Models and add an API key"),
+            let warn = KB.label(L("⚠️ 键盘还没拿到配置：App「模型」页填 API Key；填了还这样，就回 App「开始」页点「复制配置给键盘」", "⚠️ This keyboard has no config yet: add an API key in the app. If you already did, tap Copy config for the keyboard in the app."),
                                 font: .systemFont(ofSize: 12), color: .systemOrange, lines: 0)
             vstack.addArrangedSubview(warn)
+            // 免费签名拿不到 App Group 时的退路：配置以文本形式走剪贴板进键盘
+            let importBtn = KB.button(L("从剪贴板导入配置", "Import config from clipboard"),
+                                      icon: "square.and.arrow.down",
+                                      font: .systemFont(ofSize: 13, weight: .semibold))
+            importBtn.heightAnchor.constraint(equalToConstant: 36).isActive = true
+            importBtn.addTarget(self, action: #selector(importConfigFromClipboard), for: .touchUpInside)
+            vstack.addArrangedSubview(importBtn)
         }
         fitBlocks = [vstack]
         return vstack
@@ -820,6 +827,20 @@ final class KeyboardViewController: UIInputViewController {
 
     @objc private func regenerate() { run(message: lastMessage, context: lastContext) }
     @objc private func backToIdle() { setMode(.idle) }
+
+    /// 免费签名（个人 Apple ID）时 App Group entitlement 常被剥掉，键盘读不到 App 存的配置。
+    /// 退路：App「开始」页把整份配置编码进剪贴板，这里解码后存进键盘自己的 UserDefaults。
+    @objc private func importConfigFromClipboard() {
+        guard hasFullAccess else { setMode(.gate); return }
+        guard let cfg = JevConfigTransfer.decode(UIPasteboard.general.string) else {
+            errorText = L("剪贴板里没有配置。先在 App「开始」页点「复制配置给键盘」，再回到这里导入。",
+                          "No config in the clipboard. Tap Copy config for the keyboard in the app, then import here.")
+            setMode(.error)
+            return
+        }
+        JevStore.saveConfig(cfg)
+        setMode(.idle)
+    }
 
     private func run(message: String, context: String?) {
         lastMessage = message
